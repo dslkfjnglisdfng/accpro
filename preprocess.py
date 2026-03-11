@@ -33,58 +33,82 @@ def _syn_acc(v, smooth_n=4):
             [(v[i] + v[i + smooth_n * 2] - 2 * v[i + smooth_n]) * 3600 / smooth_n ** 2
              for i in range(0, v.shape[0] - smooth_n * 2)])
     return acc
+def _skew_to_vec(M):
+    wx = M[..., 2, 1]
+    wy = M[..., 0, 2]
+    wz = M[..., 1, 0]
+    return torch.stack([wx, wy, wz], dim=-1)
 
 
-def _syn_rot_d(rot, fps=60):
+def _syn_rot_d_rel(rot, fps=60, pad="copy"):
     r"""
-    计算角速度向量
-    Input: rot (T, J, 3, 3)
-    Output: omega (T, J, 3)
+    用相邻帧相对旋转 + 小角度反对称近似，直接合成 world frame 角速度
+
+    Input:
+        rot: (T, J, 3, 3), assumed rot[t,j] = ^W R_B
+        fps: sampling rate
+        pad: "copy" or "zero"
+
+    Output:
+        omega: (T, J, 3), ^W omega
     """
-    # 1. 导数 (T-2, J, 3, 3)
-    rot_dot = (rot[2:] - rot[:-2]) * (fps / 2)
-    rot_curr = rot[1:-1]
+    if rot.shape[0] < 2:
+        return torch.zeros(rot.shape[0], rot.shape[1], 3, device=rot.device, dtype=rot.dtype)
 
-    # 2. 反对称矩阵
-    omega_mat = torch.matmul(rot_dot, rot_curr.transpose(-1, -2))
+    dt = 1.0 / fps
+    Rk = rot[:-1]
+    Rk1 = rot[1:]
 
-    # 3. 提取向量 [wx, wy, wz]
-    # Matrix结构: [[0, -z, y], [z, 0, -x], [-y, x, 0]]
-    w_x = omega_mat[..., 2, 1]
-    w_y = omega_mat[..., 0, 2]
-    w_z = omega_mat[..., 1, 0]
-    omega = torch.stack([w_x, w_y, w_z], dim=-1)  # (T-2, J, 3)
+    # Relative rotation expressed in world frame
+    R_rel = torch.matmul(Rk1, Rk.transpose(-1, -2))
 
-    # 4. Padding (dim=0 是时间)
-    padding = torch.zeros_like(omega[:1])
-    omega = torch.cat((padding, omega, padding), dim=0)
+    # Small-angle approximation:
+    # R_rel ≈ I + [omega*dt]_x
+    omega_mat = (R_rel - R_rel.transpose(-1, -2)) / (2.0 * dt)
+
+    # enforce skew symmetry
+    omega_mat = 0.5 * (omega_mat - omega_mat.transpose(-1, -2))
+
+    omega = _skew_to_vec(omega_mat)
+
+    if pad == "copy":
+        omega = torch.cat((omega[:1], omega), dim=0)
+    elif pad == "zero":
+        omega = torch.cat((torch.zeros_like(omega[:1]), omega), dim=0)
+    else:
+        raise ValueError(f"Unsupported pad: {pad}")
+
     return omega
-
-
-def _syn_rot_dd(rot, fps=60, smooth_n=4):
+def _syn_rot_dd_rel(rot, fps=60, smooth_n=4, pad="copy"):
     r"""
-    计算角加速度向量 (带平滑)
-    Input: rot (T, J, 3, 3)
-    Output: alpha (T, J, 3)
+    基于 world frame 角速度合成 world frame 角加速度
     """
-    # 1. 先获取角速度向量 (T, J, 3)
-    v = _syn_rot_d(rot, fps)
+    omega = _syn_rot_d_rel(rot, fps=fps, pad=pad)  # (T, J, 3), ^W omega
+    T = omega.shape[0]
+    dt = 1.0 / fps
 
-    mid = smooth_n // 2
+    if T < 3:
+        return torch.zeros_like(omega)
 
-    # 2. 计算导数 (类似 _syn_acc，但这是对速度求一阶导)
-    # (v[t+1] - v[t-1]) / (2*dt) -> dt=1/60 -> * 30 -> * (fps/2)
-    alpha = torch.stack([(v[i + 2] - v[i]) * (fps / 2) for i in range(0, v.shape[0] - 2)])
-    alpha = torch.cat((torch.zeros_like(alpha[:1]), alpha, torch.zeros_like(alpha[:1])), dim=0)
+    alpha = torch.stack(
+        [(omega[i + 2] - omega[i]) / (2.0 * dt) for i in range(0, T - 2)],
+        dim=0
+    )
 
-    # 3. 应用平滑 (Multi-scale)
-    if mid != 0:
-        # 公式: (v[i+2n] - v[i]) / (TimeSpan)
-        # TimeSpan = 2 * n * (1/fps)
-        # Factor = fps / (2*n)
-        alpha[smooth_n:-smooth_n] = torch.stack(
-            [(v[i + smooth_n * 2] - v[i]) * (fps / (2 * smooth_n))
-             for i in range(0, v.shape[0] - smooth_n * 2)])
+    if pad == "copy":
+        alpha = torch.cat((alpha[:1], alpha, alpha[-1:]), dim=0)
+    elif pad == "zero":
+        alpha = torch.cat((torch.zeros_like(alpha[:1]), alpha, torch.zeros_like(alpha[:1])), dim=0)
+    else:
+        raise ValueError(f"Unsupported pad: {pad}")
+
+    if smooth_n is not None and smooth_n > 1 and 2 * smooth_n < T:
+        alpha_wide = torch.stack(
+            [(omega[i + 2 * smooth_n] - omega[i]) / (2.0 * smooth_n * dt)
+             for i in range(0, T - 2 * smooth_n)],
+            dim=0
+        )
+        alpha[smooth_n:-smooth_n] = alpha_wide
 
     return alpha
 def process_amass():
@@ -118,7 +142,6 @@ def process_amass():
     tran = amass_rot.matmul(tran.unsqueeze(-1)).view_as(tran)
     pose[:, 0] = art.math.rotation_matrix_to_axis_angle(
         amass_rot.matmul(art.math.axis_angle_to_rotation_matrix(pose[:, 0])))
-
     print('Synthesizing IMU accelerations and orientations')
     b = 0
     out_pose, out_shape, out_tran, out_joint, out_vrot,out_vrot_d,out_vrot_dd, out_vacc,out_v = [], [], [], [], [], [],[],[],[]
@@ -132,8 +155,8 @@ def process_amass():
         out_joint.append(joint[:, :24].contiguous().clone())  # N, 24, 3
         out_v.append(vert.contiguous().clone())
         out_vacc.append(_syn_acc(vert[:, vi_mask]))  # N, 6, 3
-        out_vrot_d.append(_syn_rot_d(grot[:, ji_mask]))
-        out_vrot_dd.append(_syn_rot_dd(grot[:, ji_mask]))
+        out_vrot_d.append(_syn_rot_d_rel(grot[:, ji_mask]))
+        out_vrot_dd.append(_syn_rot_dd_rel(grot[:, ji_mask]))
         out_vrot.append(grot[:, ji_mask])  # N, 6, 3, 3
 
         b += l
@@ -150,8 +173,60 @@ def process_amass():
     torch.save(out_vrot_dd, os.path.join(paths.amass_dir, 'valpha.pt'))
     torch.save(out_vacc, os.path.join(paths.amass_dir, 'vacc.pt'))
     print('Synthetic AMASS dataset is saved at', paths.amass_dir)
+def process_amass_for_test():
+    data_pose, data_trans, data_beta, length = [], [], [], []
+    for ds_name in amass_data:
+        print('\rReading', ds_name)
+        for npz_fname in tqdm(glob.glob(os.path.join(paths.raw_amass_dir, ds_name, '*/*_poses.npz'))):
+            try: cdata = np.load(npz_fname)
+            except: continue
 
+            framerate = int(cdata['mocap_framerate'])
+            if framerate == 120: step = 2
+            elif framerate == 60 or framerate == 59: step = 1
+            else: continue
 
+            data_pose.extend(cdata['poses'][::step].astype(np.float32))
+            data_trans.extend(cdata['trans'][::step].astype(np.float32))
+            data_beta.append(cdata['betas'][:10])
+            length.append(cdata['poses'][::step].shape[0])
+
+    assert len(data_pose) != 0, 'AMASS dataset not found. Check config.py or comment the function process_amass()'
+    length = torch.tensor(length, dtype=torch.int)
+    shape = torch.tensor(np.asarray(data_beta, np.float32))
+    tran = torch.tensor(np.asarray(data_trans, np.float32))
+    pose = torch.tensor(np.asarray(data_pose, np.float32)).view(-1, 52, 3)
+    pose[:, 23] = pose[:, 37]     # right hand
+    pose = pose[:, :24].clone()   # only use body
+
+    # align AMASS global fame with DIP
+    amass_rot = torch.tensor([[[1, 0, 0], [0, 0, 1], [0, -1, 0.]]])
+    tran = amass_rot.matmul(tran.unsqueeze(-1)).view_as(tran)
+    pose[:, 0] = art.math.rotation_matrix_to_axis_angle(
+        amass_rot.matmul(art.math.axis_angle_to_rotation_matrix(pose[:, 0])))
+    print('Synthesizing IMU accelerations and orientations')
+    b = 0
+    out_pose, out_shape, out_tran, out_joint, out_vrot,out_vrot_d,out_vrot_dd, out_vacc,out_v = [], [], [], [], [], [],[],[],[]
+    for i, l in tqdm(list(enumerate(length))):
+        if l <= 12: b += l; print('\tdiscard one sequence with length', l); continue
+        p = art.math.axis_angle_to_rotation_matrix(pose[b:b + l]).view(-1, 24, 3, 3)
+        grot, joint, vert = body_model.forward_kinematics(p, shape[i], tran[b:b + l], calc_mesh=True)
+        out_pose.append(pose[b:b + l].clone())  # N, 24, 3
+        out_tran.append(tran[b:b + l].clone())  # N, 3
+        out_shape.append(shape[i].clone())  # 10
+        out_joint.append(joint[:, :24].contiguous().clone())  # N, 24, 3
+        out_v.append(vert.contiguous().clone())
+        out_vacc.append(_syn_acc(vert[:, vi_mask]))  # N, 6, 3
+        out_vrot_d.append(_syn_rot_d_rel(grot[:, ji_mask]))
+        out_vrot_dd.append(_syn_rot_dd_rel(grot[:, ji_mask]))
+        out_vrot.append(grot[:, ji_mask])  # N, 6, 3, 3
+
+        b += l
+
+    print('Saving')
+    os.makedirs(paths.amass_dir, exist_ok=True)
+    torch.save({'acc': out_vacc, 'ori': out_vrot, 'pose': out_pose, 'tran': out_tran,'v':out_v,'omega':out_vrot_d,'alpha':out_vrot_dd}, os.path.join(paths.amass_dir, 'test.pt'))
+    print('Preprocessed AMASS dataset for test is saved at', paths.amass_dir)
 def process_dipimu():
     imu_mask = [7, 8, 11, 12, 0, 2]
     test_split = ['s_09']
@@ -248,6 +323,6 @@ def process_totalcapture():
 
 
 if __name__ == '__main__':
-    #process_amass()
-    process_dipimu()
+    process_amass_for_test()
+    #process_dipimu()
     #process_totalcapture()

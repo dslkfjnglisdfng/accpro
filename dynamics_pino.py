@@ -100,20 +100,6 @@ class PhysicsOptimizer:
             As1.append(A)  # 72 * 75
             bs1.append(b)  # 72
 
-        # joint position PD controller (using root velocity + ref pose to determine target joint position)
-        # if False:
-        #     for joint_name in ['ROOT', 'LHIP', 'RHIP', 'SPINE1', 'LKNEE', 'RKNEE', 'SPINE2', 'LANKLE', 'RANKLE',
-        #                        'SPINE3', 'LFOOT', 'RFOOT', 'NECK', 'LCLAVICLE', 'RCLAVICLE', 'HEAD', 'LSHOULDER',
-        #                        'RSHOULDER', 'LELBOW', 'RELBOW', 'LWRIST', 'RWRIST', 'LHAND', 'RHAND']:
-        #         joint_id = vars(Body)[joint_name]
-        #         cur_vel = self.model.calc_point_velocity(q, qdot, joint_id)
-        #         cur_pos = self.model.calc_body_position(q, joint_id)
-        #         tar_pos = self.model.calc_body_position(q_ref, joint_id) - q_ref[:3] + q[:3] + v_ref[0] * self.params['delta_t']
-        #         a_des = 3600 * (tar_pos - cur_pos) - 60 * cur_vel
-        #         A = self.model.calc_point_Jacobian(q, joint_id)
-        #         b = -self.model.calc_point_acceleration(q, qdot, np.zeros(75), joint_id) + a_des
-        #         As1.append(A * 2)
-        #         bs1.append(b * 2)
 
         # joint position PD controller (using joint velocity to determine target joint position)
         if True:
@@ -211,7 +197,6 @@ class PhysicsOptimizer:
         self.q = q
         self.qdot = qdot
         self.last_x = x
-
         if self.debug:
             # self.clock.tick(60)   # please install pygame
             set_pose(self.id_robot, q)

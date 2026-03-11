@@ -103,7 +103,7 @@ def run_pipeline(net, data_dir, sequence_ids=None):
     Save the estimated [Pose[num_frames, 24, 3, 3], Tran[num_frames, 3]] for each of `sequence_ids`.
     """
     print('Loading imu data from "%s"' % data_dir)
-    accs, rots, poses, _ ,_,_,_= torch.load(os.path.join(data_dir, 'test.pt')).values()
+    accs, rots, poses, _ = torch.load(os.path.join(data_dir, 'test.pt')).values()
     init_poses = [art.math.axis_angle_to_rotation_matrix(_[0]) for _ in poses]
 
     data_name = os.path.basename(data_dir)
@@ -128,7 +128,7 @@ def evaluate(net, data_dir, sequence_ids=None, flush_cache=False, pose_evaluator
     result_dir = os.path.join(paths.result_dir, data_name, net.name)
     print_title('Evaluating "%s" on "%s"' % (net.name, data_name))
 
-    _, _, pose_t_all, tran_t_all,_,_,_ = torch.load(os.path.join(data_dir, 'test.pt')).values()
+    _, _, pose_t_all, tran_t_all = torch.load(os.path.join(data_dir, 'test.pt')).values()
 
     if sequence_ids is None:
         sequence_ids = list(range(len(pose_t_all)))
@@ -204,4 +204,4 @@ if __name__ == '__main__':
     # evaluate(net, paths.totalcapture_dir, pose_evaluator=reduced_pose_evaluator, evaluate_pose=True, evaluate_tran=True, evaluate_zmp=True, flush_cache=False)
 
     print('\n')
-    evaluate(net, paths.amass_dir, pose_evaluator=reduced_pose_evaluator, evaluate_pose=True, evaluate_zmp=True, flush_cache=True)
+    evaluate(net, paths.dipimu_dir, pose_evaluator=reduced_pose_evaluator, evaluate_pose=True, evaluate_zmp=True, flush_cache=True)
